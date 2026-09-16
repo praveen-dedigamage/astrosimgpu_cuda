@@ -1,0 +1,18 @@
+# Build output
+astrosim_fused
+*.o
+build/
+build-*/
+
+# Profiler artifacts
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+
+# sbatch logs
+*.out
+*.err
+
+# OS/editor cruft
+.DS_Store
+*.swp
