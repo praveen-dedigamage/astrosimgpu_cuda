@@ -800,6 +800,7 @@ int main(int argc, char** argv) {
     // as the sentinel.
     real w_n2a_override = std::nan("");
     real w_a2n_override = std::nan("");
+    bool stp_override_disable = false;
 
     for (int i = 1; i < argc; ++i) {
         auto arg = [&](const char* name) { return std::strcmp(argv[i], name) == 0; };
@@ -813,6 +814,7 @@ int main(int argc, char** argv) {
         else if (arg("--block")) block = std::atoi(next());
         else if (arg("--w-n2a")) w_n2a_override = std::atof(next());
         else if (arg("--w-a2n")) w_a2n_override = std::atof(next());
+        else if (arg("--no-stp")) stp_override_disable = true;
         else if (arg("--help") || arg("-h")) {
             std::printf(
                 "astrosim_fused --n N_total [--seed S] [--dt 0.1] [--substeps 1] "
@@ -824,6 +826,8 @@ int main(int argc, char** argv) {
                 "--w-n2a/--w-a2n override the neuron->astrocyte / astrocyte->neuron\n"
                 "coupling weight (default 0.2 / 1.0) -- pass 0 to fully disconnect\n"
                 "one direction of the tripartite loop for A/B comparison.\n"
+                "--no-stp disables Tsodyks-Markram short-term plasticity (every\n"
+                "delivered spike then uses the raw weight, multiplier 1.0).\n"
                 "Run only through srun/sbatch -- there is no GPU on a login node.\n");
             return 0;
         } else {
@@ -837,6 +841,7 @@ int main(int argc, char** argv) {
     if (bio.noise_dt <= 0.0) bio.noise_dt = 10.0 * dt;
     if (!std::isnan(w_n2a_override)) bio.w_n2a = w_n2a_override;
     if (!std::isnan(w_a2n_override)) bio.w_a2n = w_a2n_override;
+    if (stp_override_disable) bio.stp_enabled = false;
 
     std::printf("=== astrosim_fused: race-free, kernel-fused CUDA astrosimgpu ===\n");
     std::printf("N_total=%u  N_E=%u  N_I=%u  N_A=%u  p_primary=%.6g  (fixed in-degree law, K_SYN=%.0f)\n",
