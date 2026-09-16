@@ -362,6 +362,7 @@ struct DeviceState {
 
     // Diagnostics.
     unsigned long long* spike_counter = nullptr;
+    unsigned char* ever_active = nullptr;  // per astrocyte: has Ca ever crossed SIC_th?
 };
 
 // =========================================================================
@@ -413,6 +414,12 @@ __global__ void astro_step_kernel(DeviceState s, AstroConstants c, real h_step, 
     // sic_factor(): astrosimgpu/src/astrocyte.cpp::sic_factor, verbatim.
     const real y = (ca - c.SIC_th) * 1000.0;
     const real factor = (y <= 1.0) ? 0.0 : c.SIC_scale * std::log(y);
+
+    // Diagnostic-only, own-cell write: has this astrocyte EVER crossed
+    // threshold, not just at this instant? Directly comparable to the CPU
+    // reference's "astrocytes with transients" count, unlike a single
+    // end-of-run snapshot of Ca.
+    if (factor > 0.0) s.ever_active[a] = 1;
 
     // Own row, own slot: every astrocyte writes exactly one element here.
     s.ring_sic[static_cast<std::size_t>(step % ring_slots) * s.n_astro + a] = factor;
@@ -946,6 +953,8 @@ int main(int argc, char** argv) {
 
     CUDA_CHECK(cudaMalloc(&s.spike_counter, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMemset(s.spike_counter, 0, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc(&s.ever_active, cfg.n_astro * sizeof(unsigned char)));
+    CUDA_CHECK(cudaMemset(s.ever_active, 0, cfg.n_astro * sizeof(unsigned char)));
 
     // ---- time loop ----
     const std::int64_t pre_steps = static_cast<std::int64_t>(pre_ms / dt + 0.5);
@@ -959,6 +968,13 @@ int main(int argc, char** argv) {
     if (print_every_steps <= 0) print_every_steps = static_cast<int>(std::max<std::int64_t>(1, total_steps / 20));
 
     unsigned long long spikes_before_measured = 0;
+    unsigned long long spikes_at_last_checkpoint = 0;
+    std::int64_t steps_at_last_checkpoint = pre_steps;
+    // ~10 checkpoints across the recorded window, so a runaway/settling
+    // trend (firing rate climbing over time, e.g. towards a synchronized
+    // regime) is visible instead of hidden inside one end-of-run average.
+    const std::int64_t checkpoint_every =
+        std::max<std::int64_t>(1, sim_steps / 10);
     CUDA_CHECK(cudaDeviceSynchronize());
     auto t_run0 = std::chrono::steady_clock::now();
 
@@ -990,9 +1006,33 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaMemcpy(&spikes_before_measured, s.spike_counter, sizeof(unsigned long long),
                                   cudaMemcpyDeviceToHost));
+            spikes_at_last_checkpoint = spikes_before_measured;
+            // ever_active should reflect the recorded window only, matching
+            // the CPU reference's calcium analysis (which only sees
+            // recorded-window astrocyte samples) -- discard any threshold
+            // crossings seen during the discarded transient.
+            CUDA_CHECK(cudaMemset(s.ever_active, 0, cfg.n_astro * sizeof(unsigned char)));
         }
 
-        if (step % print_every_steps == 0) {
+        // Firing rate over each ~10% slice of the recorded window: cheap
+        // (about 10 syncs total, not per step) and shows whether any excess
+        // rate is present from the start or builds up over time.
+        if (step >= pre_steps && (step - pre_steps) % checkpoint_every == 0 && step > steps_at_last_checkpoint) {
+            unsigned long long spikes_now = 0;
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(&spikes_now, s.spike_counter, sizeof(unsigned long long),
+                                  cudaMemcpyDeviceToHost));
+            const std::int64_t window_steps = step - steps_at_last_checkpoint;
+            const double window_s = window_steps * dt * 1e-3;
+            const double window_hz = static_cast<double>(spikes_now - spikes_at_last_checkpoint) /
+                                     (static_cast<double>(n_neurons) * window_s);
+            std::printf("  step %8lld / %8lld (%5.1f%%)  windowed rate: %.4f Hz\n",
+                       static_cast<long long>(step), static_cast<long long>(total_steps),
+                       100.0 * step / total_steps, window_hz);
+            std::fflush(stdout);
+            spikes_at_last_checkpoint = spikes_now;
+            steps_at_last_checkpoint = step;
+        } else if (step % print_every_steps == 0) {
             CUDA_CHECK(cudaGetLastError());
             std::printf("  step %8lld / %8lld (%5.1f%%)\r", static_cast<long long>(step),
                        static_cast<long long>(total_steps), 100.0 * step / total_steps);
@@ -1017,6 +1057,12 @@ int main(int argc, char** argv) {
     }
     mean_ca /= std::max<index_t>(1, cfg.n_astro);
 
+    std::vector<unsigned char> ever_active_host(cfg.n_astro);
+    CUDA_CHECK(cudaMemcpy(ever_active_host.data(), s.ever_active, cfg.n_astro * sizeof(unsigned char),
+                          cudaMemcpyDeviceToHost));
+    index_t ever_active_count = 0;
+    for (unsigned char v : ever_active_host) ever_active_count += v;
+
     const double wall_s = std::chrono::duration<double>(t_run1 - t_run0).count();
     const double mean_rate_hz =
         static_cast<double>(spikes_measured) / (static_cast<double>(n_neurons) * (sim_ms * 1e-3));
@@ -1027,8 +1073,11 @@ int main(int argc, char** argv) {
     std::printf("spikes (recorded win): %llu\n", spikes_measured);
     std::printf("mean firing rate     : %.4f Hz\n", mean_rate_hz);
     std::printf("mean calcium (final) : %.6g uM  (SIC_th=%.6g uM)\n", mean_ca, bio.SIC_th);
-    std::printf("astrocytes active    : %u / %u (Ca above SIC threshold at end of run)\n", active_astro,
-               cfg.n_astro);
+    std::printf("astrocytes active    : %u / %u (Ca above SIC threshold at the final step only)\n",
+               active_astro, cfg.n_astro);
+    std::printf("astrocytes engaged   : %u / %u (Ca crossed SIC threshold at ANY point in the "
+               "recorded window -- comparable to astrosimgpu's 'astrocytes with transients')\n",
+               ever_active_count, cfg.n_astro);
 
     return 0;
 }
