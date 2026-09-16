@@ -20,9 +20,9 @@
 #
 # Build first, from roihu-gpu.csc.fi:
 #   module load nvhpc/26.3
-#   make -C astrosim_cuda_fused -j
+#   make -C astrosimgpu_cuda -j
 #
-# Then, from the astrosim_cuda_fused directory:
+# Then, from the astrosimgpu_cuda directory:
 #   sbatch scripts/run_gh200.sbatch
 #
 # Override the network size (and everything else astrosim_fused takes) on

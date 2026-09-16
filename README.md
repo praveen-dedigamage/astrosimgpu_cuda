@@ -72,8 +72,9 @@ Only on the ARM/GH200 side of Roihu, same as `astrosimgpu` itself:
 
 ```bash
 ssh roihu-gpu.csc.fi          # not roihu-cpu
+git clone https://github.com/praveen-dedigamage/astrosimgpu_cuda.git
+cd astrosimgpu_cuda
 module load nvhpc/26.3
-cd astrosim_cuda_fused
 make -j
 ```
 
