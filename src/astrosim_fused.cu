@@ -93,6 +93,7 @@
 #include <chrono>
 #include <algorithm>
 #include <random>
+#include <fstream>
 
 // ----------------------------- floating point ---------------------------
 // double by default: this is the precision the model was validated at
@@ -801,6 +802,7 @@ int main(int argc, char** argv) {
     real w_n2a_override = std::nan("");
     real w_a2n_override = std::nan("");
     bool stp_override_disable = false;
+    std::string dump_edges_path;
 
     for (int i = 1; i < argc; ++i) {
         auto arg = [&](const char* name) { return std::strcmp(argv[i], name) == 0; };
@@ -815,6 +817,7 @@ int main(int argc, char** argv) {
         else if (arg("--w-n2a")) w_n2a_override = std::atof(next());
         else if (arg("--w-a2n")) w_a2n_override = std::atof(next());
         else if (arg("--no-stp")) stp_override_disable = true;
+        else if (arg("--dump-edges")) dump_edges_path = next();
         else if (arg("--help") || arg("-h")) {
             std::printf(
                 "astrosim_fused --n N_total [--seed S] [--dt 0.1] [--substeps 1] "
@@ -828,6 +831,10 @@ int main(int argc, char** argv) {
                 "one direction of the tripartite loop for A/B comparison.\n"
                 "--no-stp disables Tsodyks-Markram short-term plasticity (every\n"
                 "delivered spike then uses the raw weight, multiplier 1.0).\n"
+                "--dump-edges PATH writes the built connectivity as CSV in the same\n"
+                "format astrosimgpu's --dump-edges uses (type,source,target; type in\n"
+                "exc_primary/inh_primary/n2a/a2n, astrocyte ids prefixed 'A') and\n"
+                "exits before touching the GPU -- runs fine on a login node.\n"
                 "Run only through srun/sbatch -- there is no GPU on a login node.\n");
             return 0;
         } else {
@@ -852,6 +859,48 @@ int main(int argc, char** argv) {
                substeps, pre_ms, sim_ms, static_cast<unsigned long long>(seed),
                sizeof(real) == 8 ? "double" : "float");
 
+    // Connectivity generation is pure host code, so --dump-edges can run (and
+    // exit) here, before ever touching the GPU -- useful for diffing
+    // structure against astrosimgpu's own --dump-edges without needing an
+    // srun allocation at all.
+    auto t_conn0 = std::chrono::steady_clock::now();
+    Connectivity conn = build_connectivity(cfg, seed);
+    auto t_conn1 = std::chrono::steady_clock::now();
+    std::printf("connectivity: exc=%u inh=%u e2a=%u sic=%u edges, built in %.3f s\n",
+               conn.n_exc_edges, conn.n_inh_edges, conn.n_e2a_edges, conn.n_sic_edges,
+               std::chrono::duration<double>(t_conn1 - t_conn0).count());
+
+    if (!dump_edges_path.empty()) {
+        std::ofstream out(dump_edges_path);
+        if (!out) {
+            std::fprintf(stderr, "cannot open %s for --dump-edges\n", dump_edges_path.c_str());
+            return 1;
+        }
+        out << "type,source,target\n";
+        // inc_* is CSR-by-TARGET (row index = target, src[] = sources), the
+        // opposite orientation of astrosimgpu's CSR-by-source -- so a
+        // (source,target) pair here is (inc.src[k], row). Offsets/prefixes
+        // match astrosimgpu/src/main.cpp's --dump-edges exactly: inh_primary
+        // sources are local inhibitory indices (+n_exc for the global id,
+        // same as astrosimgpu's dump_set source_offset), astrocyte ids are
+        // prefixed "A" on whichever side they appear.
+        auto dump_inverted = [&](const char* type, const HostCSR& csr, long long src_offset,
+                                 const char* src_prefix, const char* tgt_prefix) {
+            for (std::size_t t = 0; t + 1 < csr.row_start.size(); ++t) {
+                for (index_t k = csr.row_start[t]; k < csr.row_start[t + 1]; ++k) {
+                    out << type << ',' << src_prefix << (static_cast<long long>(csr.src[k]) + src_offset)
+                        << ',' << tgt_prefix << t << '\n';
+                }
+            }
+        };
+        dump_inverted("exc_primary", conn.inc_exc, 0, "", "");
+        dump_inverted("inh_primary", conn.inc_inh, static_cast<long long>(cfg.n_exc), "", "");
+        dump_inverted("n2a", conn.inc_e2a, 0, "", "A");
+        dump_inverted("a2n", conn.inc_sic, 0, "A", "");
+        std::printf("Wrote edge list to %s\n", dump_edges_path.c_str());
+        return 0;
+    }
+
     int dev = 0;
     cudaDeviceProp prop{};
     CUDA_CHECK(cudaGetDeviceCount(&dev));
@@ -863,14 +912,6 @@ int main(int argc, char** argv) {
     }
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     std::printf("GPU: %s (sm_%d%d)\n", prop.name, prop.major, prop.minor);
-
-    // ---- connectivity (host, one-time) ----
-    auto t_conn0 = std::chrono::steady_clock::now();
-    Connectivity conn = build_connectivity(cfg, seed);
-    auto t_conn1 = std::chrono::steady_clock::now();
-    std::printf("connectivity: exc=%u inh=%u e2a=%u sic=%u edges, built in %.3f s\n",
-               conn.n_exc_edges, conn.n_inh_edges, conn.n_e2a_edges, conn.n_sic_edges,
-               std::chrono::duration<double>(t_conn1 - t_conn0).count());
 
     // ---- populations (host draws, then upload) ----
     HostRng rng(seed, 0x5EEDULL);
