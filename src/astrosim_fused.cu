@@ -795,6 +795,11 @@ int main(int argc, char** argv) {
     real pre_ms = 1000.0, sim_ms = 5000.0;
     int block = 128;
     int print_every_steps = 0;  // 0 -> auto (~20 prints)
+    // NaN sentinel = "not overridden, keep the config default" -- 0 is a
+    // legitimate value (fully disconnects that direction) so it can't double
+    // as the sentinel.
+    real w_n2a_override = std::nan("");
+    real w_a2n_override = std::nan("");
 
     for (int i = 1; i < argc; ++i) {
         auto arg = [&](const char* name) { return std::strcmp(argv[i], name) == 0; };
@@ -806,13 +811,19 @@ int main(int argc, char** argv) {
         else if (arg("--pre-ms")) pre_ms = std::atof(next());
         else if (arg("--sim-ms")) sim_ms = std::atof(next());
         else if (arg("--block")) block = std::atoi(next());
+        else if (arg("--w-n2a")) w_n2a_override = std::atof(next());
+        else if (arg("--w-a2n")) w_a2n_override = std::atof(next());
         else if (arg("--help") || arg("-h")) {
             std::printf(
                 "astrosim_fused --n N_total [--seed S] [--dt 0.1] [--substeps 1] "
                 "[--pre-ms 1000] [--sim-ms 5000] [--block 128]\n"
+                "         [--w-n2a W] [--w-a2n W]\n"
                 "N_total is split into neurons and astrocytes by the same fixed-\n"
                 "in-degree scaling law astrosimgpu/scripts/roihu/gen_neuron_scaling_\n"
                 "configs.py uses: N_E=0.8*N, N_I=0.2*N, N_A=N/5, p_primary=80/N_E.\n"
+                "--w-n2a/--w-a2n override the neuron->astrocyte / astrocyte->neuron\n"
+                "coupling weight (default 0.2 / 1.0) -- pass 0 to fully disconnect\n"
+                "one direction of the tripartite loop for A/B comparison.\n"
                 "Run only through srun/sbatch -- there is no GPU on a login node.\n");
             return 0;
         } else {
@@ -824,10 +835,14 @@ int main(int argc, char** argv) {
     ScalingConfig cfg = ScalingConfig::make(n_total);
     Biology bio;
     if (bio.noise_dt <= 0.0) bio.noise_dt = 10.0 * dt;
+    if (!std::isnan(w_n2a_override)) bio.w_n2a = w_n2a_override;
+    if (!std::isnan(w_a2n_override)) bio.w_a2n = w_a2n_override;
 
     std::printf("=== astrosim_fused: race-free, kernel-fused CUDA astrosimgpu ===\n");
     std::printf("N_total=%u  N_E=%u  N_I=%u  N_A=%u  p_primary=%.6g  (fixed in-degree law, K_SYN=%.0f)\n",
                n_total, cfg.n_exc, cfg.n_inh, cfg.n_astro, cfg.p_primary, ScalingConfig::K_SYN);
+    std::printf("w_n2a=%g  w_a2n=%g%s\n", bio.w_n2a, bio.w_a2n,
+               (!std::isnan(w_n2a_override) || !std::isnan(w_a2n_override)) ? "  (overridden)" : "");
     std::printf("dt=%g ms  substeps=%d  pre=%g ms  sim=%g ms  seed=%llu  precision=%s\n", dt,
                substeps, pre_ms, sim_ms, static_cast<unsigned long long>(seed),
                sizeof(real) == 8 ? "double" : "float");
